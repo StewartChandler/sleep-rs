@@ -3,4 +3,22 @@ name = "sleep_rs"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name="sleep_rs"
+test=false
+bench=false
+
 [dependencies]
+# libc = { version = "0.2.178", default-features = false }
+no-panic = "0.1.35"
+
+[profile.dev]
+panic="abort"
+
+[profile.release]
+panic="abort"
+
+# [unstable]
+# build-std=["core"]
+# build-std-features=[]
+# panic="abort"
