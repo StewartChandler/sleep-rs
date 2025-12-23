@@ -5,5 +5,3 @@ build-std-features=["compiler-builtins-mem"]
 
 [build]
 target="x86_64-pc-windows-msvc"
-# do intend to remove this, but rn libm won't compile without it
-rustflags = ["-Ctarget-feature=+avx512f"]

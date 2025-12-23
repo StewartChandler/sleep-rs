@@ -56,7 +56,6 @@ fn exit_process(code: u32) -> ! {
 
 ///
 ///
-#[inline(always)]
 fn get_cmd_line() -> Option<&'static str> {
     // returns a null terminated const c string of the entire comand line encoded as ascii
     let cstr = unsafe { win32::GetCommandLineA() };
@@ -75,7 +74,6 @@ fn get_cmd_line() -> Option<&'static str> {
     }
 }
 
-#[inline(always)]
 fn round(x: f32) -> i32 {
     if !x.is_finite() {
         return 0;
