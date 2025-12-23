@@ -1,5 +1,5 @@
 [toolchain]
-channel = "stable"
-components = ["rust-docs", "clippy"]
+channel = "nightly"
+components = ["rust-docs", "clippy", "rustfmt"]
 profile="minimal"
 targets=["x86_64-pc-windows-msvc"]
