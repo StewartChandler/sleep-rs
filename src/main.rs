@@ -115,7 +115,7 @@ fn round(x: f32) -> i32 {
 
     const EXPONENT_BITS: u32 = u32::BITS - f32::MANTISSA_DIGITS;
     const EXPONENT_MSK: u32 = (1u32 << EXPONENT_BITS) - 1;
-    const EXPONENT_NEG_EMIN: i32 = (1i32 << (EXPONENT_BITS - 1)) - 2;
+    const EXPONENT_NEG_EMIN: i32 = (1i32 << (EXPONENT_BITS - 1)) - 1;
 
     let bits = x.to_bits();
     let exp = (((bits >> (f32::MANTISSA_DIGITS - 1)) & EXPONENT_MSK) as i32) - EXPONENT_NEG_EMIN;
@@ -135,23 +135,32 @@ fn round(x: f32) -> i32 {
     // was `0`, and does nothing if it was `-1`, so the result is that `sign` is `-1` if the sign
     // bit was `1` and `1` if it was `0`
     let sign = ((bits as i32) >> (i32::BITS - 1)) | 1i32;
-    let num = if exp >= 0 && exp < ((u32::BITS - f32::MANTISSA_DIGITS) as i32) {
-        let int_pt = mantissa >> ((f32::MANTISSA_DIGITS as i32) - exp);
-        let frac_pt =
-            (mantissa << (((u32::BITS - f32::MANTISSA_DIGITS) as i32) + exp)) - ((!int_pt) & 1);
-        (int_pt + (frac_pt >> (u32::BITS - 1))).min(i32::MAX as u32) as i32
+    let num = if exp >= (u32::BITS - 1) as i32 {
+        // exp [31,inf)
+        // bc of the wrapping add, will be `i32::MIN` if sign bit is set
+        i32::MAX.wrapping_add((bits >> (i32::BITS - 1)) as i32)
+    } else if exp >= (f32::MANTISSA_DIGITS - 1) as i32 {
+        // exp [23, 31)
+        (mantissa << (exp - (f32::MANTISSA_DIGITS - 1) as i32)) as i32 * sign
+    } else if exp >= 0 {
+        // exp [0, 23)
+        // is the value truncated
+        let base_val = mantissa >> ((f32::MANTISSA_DIGITS - 1) as i32 - exp);
+        // add 1 (for rounding purposes) if fract part > .5 or if fractional part == .5 and the last
+        // bit of the integral part is 1
+        (base_val
+            + (((mantissa << (EXPONENT_BITS + 1 + exp as u32)).saturating_sub(!base_val & 0b1))
+                >> (u32::BITS - 1)) as u32) as i32
+            * sign
     } else if exp == -1 {
-        ((mantissa - 1) >> (f32::MANTISSA_DIGITS - 1)) as i32
-    } else if exp < -1 {
-        0
-    } else if exp >= ((u32::BITS - f32::MANTISSA_DIGITS) as i32) {
-        i32::MAX
+        // exp == -1 means x == 0.5yyyyyy, so if yyyyyy != 1 then round up (1) else round towards an
+        // even number (0)
+        ((bits & ((1 << (f32::MANTISSA_DIGITS - 1)) - 1)) != 0) as i32 * sign
     } else {
-        todo!()
+        0
     };
 
-    // TODO: Fix case of i32::MIN
-    num * sign
+    num
 }
 
 #[inline(always)]
