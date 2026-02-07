@@ -2,16 +2,16 @@
 #![no_main]
 
 use core::{
+    ffi::{CStr, c_char},
     fmt::{self, Write},
+    i32,
     panic::PanicInfo,
-    ptr::{self, slice_from_raw_parts},
+    ptr::{self},
 };
 
-#[panic_handler]
-fn panic_handler(_info: &PanicInfo) -> ! {
-    loop {}
-}
+use no_panic::no_panic;
 
+// needs to be seen by the linker in order to make floats work
 #[allow(non_upper_case_globals)]
 #[unsafe(no_mangle)]
 pub static _fltused: i32 = 0;
@@ -26,15 +26,26 @@ mod win32 {
     pub type STD_HANDLE = u32;
     pub const STD_OUTPUT_HANDLE: STD_HANDLE = 4294967285u32;
     pub const STD_ERROR_HANDLE: STD_HANDLE = 4294967284u32;
-    pub const INVALID_HANDLE_VALUE: HANDLE = 0xffffffffffffffff as *mut core::ffi::c_void;
+    pub const INVALID_HANDLE_VALUE: HANDLE = usize::MAX as HANDLE;
 
     #[allow(non_snake_case)]
     #[link(name = "kernel32")]
     unsafe extern "system" {
+        /// # Safety
+        ///   - should avoid calling from a DLL
         pub fn ExitProcess(uexitcode: u32) -> !;
+        /// # Safety
+        ///   - no safety requirements
         pub fn GetCommandLineA() -> PCSTR;
+        /// # Safety
+        ///   - returns `win32::INVALID_HANDLE_VALUE` if it fails
+        ///   - returns `ptr::null()` if no such handle exists
         pub fn GetStdHandle(handle_type: STD_HANDLE) -> HANDLE;
+        /// # Safety
+        ///   - no safety requirements
         pub fn Sleep(nmillisecs: u32);
+        /// # Safety
+        ///   - `lpreserved` must be null
         pub fn WriteConsoleA(
             hconsoleoutput: HANDLE,
             lpbuffer: PCSTR,
@@ -51,29 +62,50 @@ mod win32 {
 ///   - `code`: the exit code of the process
 #[inline(always)]
 fn exit_process(code: u32) -> ! {
+    // Saftey:
+    //   - this is not marked as pub, this code can only be executed by this program, so it will
+    //     not be executed as a dll
     unsafe { win32::ExitProcess(code) }
 }
 
+/// returns the command used to invoke this program, this is what is used for argument passing
 ///
-///
+/// # Returns
+///   - `None` if `GetCommandLineA` returns a null pointer, or the string returned is not valid
+///     UTF-8
+///   - `Some(&'static str)` upon successfully fetching the command
 fn get_cmd_line() -> Option<&'static str> {
-    // returns a null terminated const c string of the entire comand line encoded as ascii
+    // returns a null terminated const c string of the entire command line encoded as ascii
     let cstr = unsafe { win32::GetCommandLineA() };
     if cstr.is_null() {
         None
     } else {
-        let end = (0usize..(isize::MAX as usize / size_of::<u8>()))
-            .map(|idx| unsafe { cstr.add(idx) })
-            .find(|&ptr| unsafe { *ptr } == b'\0')?;
-
-        let len = unsafe { end.offset_from_unsigned(cstr) };
-
-        let bslice = unsafe { slice_from_raw_parts(cstr, len).as_ref::<'static>()? };
-
-        str::from_utf8(bslice).ok()
+        // Safety:
+        //   - cstr returned from `GetCommandLineA` is a `nul` terminated c str
+        //   - the result of `GetCommandLineA` is not to be modified or freed by any other code
+        //     and the lifetime is to be managed by the system, so the result should be a const str
+        //     that will be valid for any lifetime
+        // Unsafety:
+        //   - the length of the string could possibly be greater than `isize::MAX`, in practice
+        //     this will never happen, but the I don't know if windows actually makes any garuntees
+        //     of that
+        //   - the string may not exist for the `'static` lifetime, the documentation just says that
+        //     the lifetime is managed by the system, but give no bounds on how long that is, I am
+        //     assuming then, that the string will be available for however long you need it to be,
+        //     hence static lifetime, but I really don't know
+        let cstr = unsafe { CStr::from_ptr(cstr as *const c_char) };
+        cstr.to_str().ok()
     }
 }
 
+/// rounds an `f32` to the nearest `i32` rounding towards even numbers in the case of a `.5`
+/// fractional part
+///
+/// # Returns
+///   - `0i32` if `x` is not finite
+///   - `i32::MAX` if `x` is greater than `i32::MAX`
+///   - `i32::MIN` if `x` is less than `i32::MIN`
+#[no_panic]
 fn round(x: f32) -> i32 {
     if !x.is_finite() {
         return 0;
@@ -81,16 +113,45 @@ fn round(x: f32) -> i32 {
         return 0;
     }
 
+    const EXPONENT_BITS: u32 = u32::BITS - f32::MANTISSA_DIGITS;
+    const EXPONENT_MSK: u32 = (1u32 << EXPONENT_BITS) - 1;
+    const EXPONENT_NEG_EMIN: i32 = (1i32 << (EXPONENT_BITS - 1)) - 2;
+
     let bits = x.to_bits();
-    let exp = ((bits >> (f32::MANTISSA_DIGITS - 1)) & 0xff) - 126;
+    let exp = (((bits >> (f32::MANTISSA_DIGITS - 1)) & EXPONENT_MSK) as i32) - EXPONENT_NEG_EMIN;
+    // extracts the mantissa bits from the float by masking off the portion stored in the float
+    //    0b0_10000001_01000000000000000000000                                             == 5.0f32
+    //  & 0b0_00000000_11111111111111111111111            == ((1 << (f32::MANTISSA_DIGITS - 1)) - 1)
+    //  = 0b0_00000000_01000000000000000000000   == (bits & ((1 << (f32::MANTISSA_DIGITS - 1)) - 1))
+    // then we add in the leading 1 that is elided from the iee754 float format
+    //    0b0_00000000_01000000000000000000000
+    //  | 0b0_00000001_00000000000000000000000                  == (1 << (f32::MANTISSA_DIGITS - 1))
+    //  = 0b0_00000001_01000000000000000000000
     let mantissa =
         (1 << (f32::MANTISSA_DIGITS - 1)) | (bits & ((1 << (f32::MANTISSA_DIGITS - 1)) - 1));
-    let sign = ((bits as i32) >> 31) | 1;
-    let int_pt = mantissa >> (f32::MANTISSA_DIGITS - exp);
-    let frac_pt = (mantissa << (32 + exp - f32::MANTISSA_DIGITS)) - ((!int_pt) & 1);
-    let num = int_pt + (frac_pt >> 31);
+    // extracts the sign as an i32 by first using a arithmatic shift right to sign extend the sign
+    // bit of the float to the rest of the bits i.e. `0b111 ... 111` (`-1i32`) if the sign bit is 1,
+    // otherwise `0b000 ... 000` (0i32) if it is 0, then the bitwise or makes the result `1` if it
+    // was `0`, and does nothing if it was `-1`, so the result is that `sign` is `-1` if the sign
+    // bit was `1` and `1` if it was `0`
+    let sign = ((bits as i32) >> (i32::BITS - 1)) | 1i32;
+    let num = if exp >= 0 && exp < ((u32::BITS - f32::MANTISSA_DIGITS) as i32) {
+        let int_pt = mantissa >> ((f32::MANTISSA_DIGITS as i32) - exp);
+        let frac_pt =
+            (mantissa << (((u32::BITS - f32::MANTISSA_DIGITS) as i32) + exp)) - ((!int_pt) & 1);
+        (int_pt + (frac_pt >> (u32::BITS - 1))).min(i32::MAX as u32) as i32
+    } else if exp == -1 {
+        ((mantissa - 1) >> (f32::MANTISSA_DIGITS - 1)) as i32
+    } else if exp < -1 {
+        0
+    } else if exp >= ((u32::BITS - f32::MANTISSA_DIGITS) as i32) {
+        i32::MAX
+    } else {
+        todo!()
+    };
 
-    (num as i32) * sign
+    // TODO: Fix case of i32::MIN
+    num * sign
 }
 
 #[inline(always)]
@@ -129,6 +190,11 @@ impl<const HT: win32::STD_HANDLE> Write for WinHandleOut<HT> {
 
 type WinStdOut = WinHandleOut<{ win32::STD_OUTPUT_HANDLE }>;
 type WinErrOut = WinHandleOut<{ win32::STD_ERROR_HANDLE }>;
+
+#[panic_handler]
+fn panic_handler(_info: &PanicInfo) -> ! {
+    exit_process(3)
+}
 
 #[unsafe(no_mangle)]
 pub extern "system" fn _start() -> ! {
