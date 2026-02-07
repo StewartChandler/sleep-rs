@@ -11,6 +11,7 @@ bench=false
 [dependencies]
 no-panic = "0.1.35"
 windows-link = "0.2.1"
+windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_System_Console", "Win32_System_Environment", "Win32_System_Threading"] }
 
 [profile.dev]
 panic="abort"

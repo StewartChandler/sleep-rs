@@ -17,43 +17,16 @@ use no_panic::no_panic;
 pub static _fltused: i32 = 0;
 
 mod win32 {
-    use core::ffi::c_void;
-
-    pub type PCSTR = *const u8;
-    pub type HANDLE = *mut c_void;
-    pub type BOOL = i32;
-    #[allow(non_camel_case_types)]
-    pub type STD_HANDLE = u32;
-    pub const STD_OUTPUT_HANDLE: STD_HANDLE = 4294967285u32;
-    pub const STD_ERROR_HANDLE: STD_HANDLE = 4294967284u32;
-    pub const INVALID_HANDLE_VALUE: HANDLE = usize::MAX as HANDLE;
-
-    #[allow(non_snake_case)]
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        /// # Safety
-        ///   - should avoid calling from a DLL
-        pub fn ExitProcess(uexitcode: u32) -> !;
-        /// # Safety
-        ///   - no safety requirements
-        pub fn GetCommandLineA() -> PCSTR;
-        /// # Safety
-        ///   - returns `win32::INVALID_HANDLE_VALUE` if it fails
-        ///   - returns `ptr::null()` if no such handle exists
-        pub fn GetStdHandle(handle_type: STD_HANDLE) -> HANDLE;
-        /// # Safety
-        ///   - no safety requirements
-        pub fn Sleep(nmillisecs: u32);
-        /// # Safety
-        ///   - `lpreserved` must be null
-        pub fn WriteConsoleA(
-            hconsoleoutput: HANDLE,
-            lpbuffer: PCSTR,
-            nnumberofcharstowrite: u32,
-            lpnumberofcharswritten: *mut u32,
-            lpreserved: *const c_void,
-        ) -> BOOL;
-    }
+    pub use windows_sys::Win32::{
+        Foundation::{HANDLE, INVALID_HANDLE_VALUE},
+        System::{
+            Console::{
+                GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_OUTPUT_HANDLE, WriteConsoleA,
+            },
+            Environment::GetCommandLineA,
+            Threading::{ExitProcess, Sleep},
+        },
+    };
 }
 
 /// gracefully terminates the current process
@@ -109,6 +82,10 @@ fn get_cmd_line() -> Option<&'static str> {
 fn round(x: f32) -> i32 {
     if !x.is_finite() {
         return 0;
+    } else if x == f32::INFINITY {
+        return i32::MAX;
+    } else if x == f32::NEG_INFINITY {
+        return i32::MIN;
     } else if x == 0.0 {
         return 0;
     }
