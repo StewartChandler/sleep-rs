@@ -2,30 +2,71 @@
 #![no_main]
 
 use core::{
-    ffi::{CStr, c_char},
-    fmt::{self, Write},
-    i32,
     panic::PanicInfo,
     ptr::{self},
+    slice,
+};
+
+const NUL_CHR: u16 = unsafe { *w!("") };
+
+macro_rules! utf16_str_lit {
+    ($s:literal) => {{
+        const C_STR: *const u16 = ::windows_sys::w!($s);
+        const NUL_CHR: u16 = unsafe { *::windows_sys::w!("") };
+
+        const OUTPUT: &'static [u16] = {
+            ::core::assert!(!C_STR.is_null(), "`C_STR` should not be null");
+            // should assert alignement of the pointer as well but for whatever reason I cannot
+
+            let mut idx = 0isize;
+            let len = loop {
+                // Safety:
+                //   - `idx` is an isize so the offset in bytes must fit in an isize
+                //   - as the pointer is a string derived from a system call, it should all be a
+                //     part of the same contiguous allocation
+                let end_ptr = unsafe { C_STR.offset(idx) };
+
+                // there must be a nul terminator at the end of the string
+                if unsafe { *end_ptr } == NUL_CHR {
+                    break idx;
+                }
+
+                idx += 1;
+            } as usize;
+            // Saftey:
+            //   - `cstr` is non-null alligned and part of a contiguous allocation valid for reads
+            //     of `size * size_of::<u16>()` bytes.
+            //   - `cstr` does point to `size` consecutive properly initialized values of u16 bc it
+            //     was given to us by the os
+            //   - the data should not be mutated bc it is a const c-string given to us by the os
+            //   - size should not exceed that which would make
+            //     `size * size_of::<u16>() > isize::MAX`
+            unsafe { slice::from_raw_parts(C_STR, len) }
+        };
+
+        OUTPUT
+    }};
+}
+
+use windows_sys::{
+    Win32::{
+        Foundation::{HANDLE, INVALID_HANDLE_VALUE},
+        System::{
+            Console::{
+                GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_OUTPUT_HANDLE, WriteConsoleW,
+            },
+            Environment::GetCommandLineW,
+            Threading::{ExitProcess, Sleep},
+        },
+    },
+    core::PCWSTR,
+    w,
 };
 
 // needs to be seen by the linker in order to make floats work
 #[allow(non_upper_case_globals)]
 #[unsafe(no_mangle)]
 pub static _fltused: i32 = 0;
-
-mod win32 {
-    pub use windows_sys::Win32::{
-        Foundation::{HANDLE, INVALID_HANDLE_VALUE},
-        System::{
-            Console::{
-                GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_OUTPUT_HANDLE, WriteConsoleA,
-            },
-            Environment::GetCommandLineA,
-            Threading::{ExitProcess, Sleep},
-        },
-    };
-}
 
 /// gracefully terminates the current process
 ///
@@ -36,144 +77,221 @@ fn exit_process(code: u32) -> ! {
     // Saftey:
     //   - this is not marked as pub, this code can only be executed by this program, so it will
     //     not be executed as a dll
-    unsafe { win32::ExitProcess(code) }
+    unsafe { ExitProcess(code) }
 }
 
 /// returns the command used to invoke this program, this is what is used for argument passing
 ///
 /// # Returns
-///   - `None` if `GetCommandLineA` returns a null pointer, or the string returned is not valid
-///     UTF-8
-///   - `Some(&'static str)` upon successfully fetching the command
-fn get_cmd_line() -> Option<&'static str> {
-    // returns a null terminated const c string of the entire command line encoded as ascii
-    let cstr = unsafe { win32::GetCommandLineA() };
-    if cstr.is_null() {
-        None
-    } else {
-        // Safety:
-        //   - cstr returned from `GetCommandLineA` is a `nul` terminated c str
-        //   - the result of `GetCommandLineA` is not to be modified or freed by any other code
-        //     and the lifetime is to be managed by the system, so the result should be a const str
-        //     that will be valid for any lifetime
-        // Unsafety:
-        //   - the length of the string could possibly be greater than `isize::MAX`, in practice
-        //     this will never happen, but the I don't know if windows actually makes any garuntees
-        //     of that
-        //   - the string may not exist for the `'static` lifetime, the documentation just says that
-        //     the lifetime is managed by the system, but give no bounds on how long that is, I am
-        //     assuming then, that the string will be available for however long you need it to be,
-        //     hence static lifetime, but I really don't know
-        let cstr = unsafe { CStr::from_ptr(cstr as *const c_char) };
-        cstr.to_str().ok()
-    }
-}
+///   - `None` if `GetCommandLineW` returns a null pointer
+///   - `Some(&'static [u16])` upon successfully fetching the command
+fn get_cmd_line_utf16() -> Option<&'static [u16]> {
+    // returns a null terminated const c string of the entire command line encoded as utf16
+    let cstr = unsafe { GetCommandLineW() };
+    (!cstr.is_null() && cstr.is_aligned()).then(|| {
+        let mut off = 0isize;
+        let size = loop {
+            // Safety:
+            //   - `off` is an isize so the offset in bytes must fit in an isize
+            //   - as the pointer is a string derived from a system call, it should all be a part of
+            //     the same contiguous allocation
+            let end_ptr = unsafe { cstr.offset(off) };
 
-/// rounds an `f32` to the nearest `i32` rounding towards even numbers in the case of a `.5`
-/// fractional part
-///
-/// # Returns
-///   - `0i32` if `x` is not finite
-///   - `i32::MAX` if `x` is greater than `i32::MAX`
-///   - `i32::MIN` if `x` is less than `i32::MIN`
-fn round(x: f32) -> i32 {
-    if !x.is_finite() {
-        return 0;
-    } else if x == f32::INFINITY {
-        return i32::MAX;
-    } else if x == f32::NEG_INFINITY {
-        return i32::MIN;
-    } else if x == 0.0 {
-        return 0;
-    }
+            // there must be a nul terminator at the end of the string
+            if unsafe { *end_ptr } == NUL_CHR {
+                break off;
+            }
 
-    const EXPONENT_BITS: u32 = u32::BITS - f32::MANTISSA_DIGITS;
-    const EXPONENT_MSK: u32 = (1u32 << EXPONENT_BITS) - 1;
-    const EXPONENT_NEG_EMIN: i32 = (1i32 << (EXPONENT_BITS - 1)) - 1;
+            off += 1;
+        } as usize;
 
-    let bits = x.to_bits();
-    let exp = (((bits >> (f32::MANTISSA_DIGITS - 1)) & EXPONENT_MSK) as i32) - EXPONENT_NEG_EMIN;
-    // extracts the mantissa bits from the float by masking off the portion stored in the float
-    //    0b0_10000001_01000000000000000000000                                             == 5.0f32
-    //  & 0b0_00000000_11111111111111111111111            == ((1 << (f32::MANTISSA_DIGITS - 1)) - 1)
-    //  = 0b0_00000000_01000000000000000000000   == (bits & ((1 << (f32::MANTISSA_DIGITS - 1)) - 1))
-    // then we add in the leading 1 that is elided from the iee754 float format
-    //    0b0_00000000_01000000000000000000000
-    //  | 0b0_00000001_00000000000000000000000                  == (1 << (f32::MANTISSA_DIGITS - 1))
-    //  = 0b0_00000001_01000000000000000000000
-    let mantissa =
-        (1 << (f32::MANTISSA_DIGITS - 1)) | (bits & ((1 << (f32::MANTISSA_DIGITS - 1)) - 1));
-    // extracts the sign as an i32 by first using a arithmatic shift right to sign extend the sign
-    // bit of the float to the rest of the bits i.e. `0b111 ... 111` (`-1i32`) if the sign bit is 1,
-    // otherwise `0b000 ... 000` (0i32) if it is 0, then the bitwise or makes the result `1` if it
-    // was `0`, and does nothing if it was `-1`, so the result is that `sign` is `-1` if the sign
-    // bit was `1` and `1` if it was `0`
-    let sign = ((bits as i32) >> (i32::BITS - 1)) | 1i32;
-    let num = if exp >= (u32::BITS - 1) as i32 {
-        // exp [31,inf)
-        // bc of the wrapping add, will be `i32::MIN` if sign bit is set
-        i32::MAX.wrapping_add((bits >> (i32::BITS - 1)) as i32)
-    } else if exp >= (f32::MANTISSA_DIGITS - 1) as i32 {
-        // exp [23, 31)
-        (mantissa << (exp - (f32::MANTISSA_DIGITS - 1) as i32)) as i32 * sign
-    } else if exp >= 0 {
-        // exp [0, 23)
-        // is the value truncated
-        let base_val = mantissa >> ((f32::MANTISSA_DIGITS - 1) as i32 - exp);
-        // add 1 (for rounding purposes) if fract part > .5 or if fractional part == .5 and the last
-        // bit of the integral part is 1
-        (base_val
-            + (((mantissa << (EXPONENT_BITS + 1 + exp as u32)).saturating_sub(!base_val & 0b1))
-                >> (u32::BITS - 1)) as u32) as i32
-            * sign
-    } else if exp == -1 {
-        // exp == -1 means x == 0.5yyyyyy, so if yyyyyy != 1 then round up (1) else round towards an
-        // even number (0)
-        ((bits & ((1 << (f32::MANTISSA_DIGITS - 1)) - 1)) != 0) as i32 * sign
-    } else {
-        0
-    };
-
-    num
+        // Saftey:
+        //   - `cstr` is non-null alligned and part of a contiguous allocation valid for reads of
+        //     `size * size_of::<u16>()` bytes.
+        //   - `cstr` does point to `size` consecutive properly initialized values of u16 bc it was
+        //     given to us by the os
+        //   - the data should not be mutated bc it is a const c-string given to us by the os
+        //   - size should not exceed that which would make `size * size_of::<u16>() > isize::MAX`
+        unsafe { slice::from_raw_parts(cstr, size) }
+    })
 }
 
 #[inline(always)]
-fn sleep(secs: f32) {
-    unsafe { win32::Sleep(round(secs * 1000.0) as u32) };
+fn sleep_ms(secs: u32) {
+    unsafe { Sleep(secs) };
 }
 
-struct WinHandleOut<const HT: win32::STD_HANDLE> {
-    handle: win32::HANDLE,
+struct WinHandleOut<const HT: STD_HANDLE> {
+    handle: HANDLE,
 }
 
-impl<const HT: win32::STD_HANDLE> WinHandleOut<HT> {
+impl<const HT: STD_HANDLE> WinHandleOut<HT> {
     pub fn new() -> Option<Self> {
-        let handle = unsafe { win32::GetStdHandle(HT) };
+        let handle = unsafe { GetStdHandle(HT) };
 
-        (!handle.is_null() && handle != win32::INVALID_HANDLE_VALUE)
-            .then_some(Self { handle: handle })
+        (!handle.is_null() && handle != INVALID_HANDLE_VALUE).then_some(Self { handle: handle })
+    }
+
+    pub fn write_utf16(&self, utf16_str: &[u16]) -> Result<(), ()> {
+        let mut chars_written = 0u32;
+        let mut ptr = utf16_str.as_ptr();
+        let mut to_write = utf16_str.len();
+
+        while to_write != 0 {
+            let result = unsafe {
+                WriteConsoleW(
+                    self.handle,
+                    ptr as PCWSTR,
+                    to_write.clamp(0, u32::MAX as usize) as u32,
+                    &mut chars_written as *mut _,
+                    ptr::null(),
+                )
+            };
+
+            // then there was an error in writing
+            if result == 0 {
+                return Err(());
+            }
+
+            to_write = to_write.saturating_sub(chars_written as usize);
+            // Safety:
+            //   - `chars_written` is bounded by the size of the slice so this pointer must be at
+            //     most pointing 1 past the end of the slice
+            // Unsafety:
+            //   - yes this does mean technically that if the allocation is at the end of the
+            //     address-space then it could "wrap" around to be 0
+            ptr = unsafe { ptr.add(chars_written as usize) };
+
+            chars_written = 0;
+        }
+
+        Ok(())
+    }
+
+    pub fn write_fixed_pt<const PTS: usize>(&self, num: u32) -> Result<(), ()> {
+        const MAX_DIGITS: usize = (u32::MAX.ilog10() + 1) as usize;
+        // one day we'll be able to do this:
+        // const _PTS_CHK: () = assert!(
+        //     PTS < MAX_DIGITS,
+        //     "pts must not be greater than the max number of digits that can be stored by a usize"
+        // );
+
+        const ZERO_CHR: u16 = unsafe { *w!("0") };
+        const POINT_CHR: u16 = unsafe { *w!(".") };
+
+        let mut buffer = [NUL_CHR; MAX_DIGITS + 2];
+        let int_part = num / (10u32.pow(PTS as u32));
+        let fract_part = num % (10u32.pow(PTS as u32));
+
+        let int_part_sz = (int_part.checked_ilog10().unwrap_or(0) + 1) as usize;
+
+        for (i, pos) in buffer[..int_part_sz].iter_mut().enumerate() {
+            let dig = (int_part / (10u32.pow((int_part_sz - 1 - i) as u32))) % 10;
+            *pos = ZERO_CHR + dig as u16;
+        }
+
+        buffer[int_part_sz] = POINT_CHR;
+
+        for (i, pos) in buffer[int_part_sz + 1..=int_part_sz + PTS]
+            .iter_mut()
+            .enumerate()
+        {
+            let dig = (fract_part / (10u32.pow((PTS - 1 - i) as u32))) % 10;
+            *pos = ZERO_CHR + dig as u16;
+        }
+
+        self.write_utf16(&buffer[..=int_part_sz + PTS + 1])
     }
 }
 
-impl<const HT: win32::STD_HANDLE> Write for WinHandleOut<HT> {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        let mut num_written: u32 = 0;
-        let res = unsafe {
-            win32::WriteConsoleA(
-                self.handle,
-                s.as_ptr(),
-                s.len() as u32,
-                &mut num_written as *mut _,
-                ptr::null(),
+fn read_fixed_pt<const PTS: usize>(buf: &[u16]) -> Result<u32, ()> {
+    const ZERO_CHR: u16 = unsafe { *w!("0") };
+    const POINT_CHR: u16 = unsafe { *w!(".") };
+
+    let (int_pt, fract_pt) = {
+        let split_idx = buf
+            .iter()
+            .enumerate()
+            .find_map(|(idx, &chr)| (chr == POINT_CHR).then_some(idx))
+            .ok_or(())?;
+
+        (&buf[..split_idx], &buf[split_idx + 1..])
+    };
+
+    int_pt
+        .iter()
+        .copied()
+        .all(|x| x >= ZERO_CHR && x < ZERO_CHR + 10)
+        .then_some(())
+        .ok_or(())?;
+    fract_pt
+        .iter()
+        .copied()
+        .all(|x| x >= ZERO_CHR && x < ZERO_CHR + 10)
+        .then_some(())
+        .ok_or(())?;
+
+    let int_pt = int_pt
+        .into_iter()
+        .rev()
+        .enumerate()
+        .map(|(idx, chr)| (chr - ZERO_CHR) as u32 * 10u32.pow(idx as u32))
+        .fold(0u32, |acc, x| acc.saturating_add(x));
+
+    // TODO: deal with rounding
+    let fract_pt = fract_pt
+        .into_iter()
+        .enumerate()
+        .map(|(idx, chr)| (chr - ZERO_CHR) as u32 * 10u32.pow((PTS - 1 - idx) as u32))
+        .fold(0u32, |acc, x| acc.saturating_add(x));
+
+    Ok(int_pt
+        .saturating_mul(10u32.pow(PTS as u32))
+        .saturating_add(fract_pt))
+}
+
+fn get_next_arg(cmd_str: &[u16]) -> Option<(&[u16], &[u16])> {
+    const BSLASH_CHR: u16 = unsafe { *w!("\\") };
+    const QUOTE_CHR: u16 = unsafe { *w!("\"") };
+    const SPACE_CHR: u16 = unsafe { *w!(" ") };
+
+    (!cmd_str.is_empty()).then(|| {
+        if cmd_str[0] == QUOTE_CHR {
+            let end_idx = cmd_str
+                .iter()
+                .enumerate()
+                .skip(1)
+                .scan(false, |st, (idx, &chr)| {
+                    let prev_st = *st;
+                    *st = !prev_st && (chr == BSLASH_CHR);
+
+                    Some((!prev_st && chr == QUOTE_CHR, idx))
+                })
+                .find_map(|(pred, idx)| (pred).then_some(idx))
+                .unwrap_or(cmd_str.len());
+
+            (
+                &cmd_str[1..end_idx.min(cmd_str.len())],
+                &cmd_str[(end_idx + 2).min(cmd_str.len())..],
             )
-        };
+        } else {
+            let end_idx = cmd_str
+                .iter()
+                .enumerate()
+                .find_map(|(idx, &chr)| (chr == SPACE_CHR).then_some(idx))
+                .unwrap_or(cmd_str.len());
 
-        (res != 0).then_some(()).ok_or(fmt::Error)
-    }
+            (
+                &cmd_str[..end_idx.min(cmd_str.len())],
+                &cmd_str[(end_idx + 1).min(cmd_str.len())..],
+            )
+        }
+    })
 }
 
-type WinStdOut = WinHandleOut<{ win32::STD_OUTPUT_HANDLE }>;
-type WinErrOut = WinHandleOut<{ win32::STD_ERROR_HANDLE }>;
+type WinStdOut = WinHandleOut<{ STD_OUTPUT_HANDLE }>;
+#[allow(unused)]
+type WinErrOut = WinHandleOut<{ STD_ERROR_HANDLE }>;
 
 #[panic_handler]
 fn panic_handler(_info: &PanicInfo) -> ! {
@@ -182,36 +300,62 @@ fn panic_handler(_info: &PanicInfo) -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn _start() -> ! {
-    let result = get_cmd_line();
-    let mut stdout = WinStdOut::new().unwrap_or_else(|| exit_process(2));
-    let mut stderr = WinErrOut::new().unwrap_or_else(|| exit_process(2));
+    let cmd_str = get_cmd_line_utf16().unwrap_or_else(|| exit_process((-1i32) as u32));
 
-    if let Some(cmd) = result {
-        let duration = cmd.split_whitespace().skip(1).next().unwrap_or_else(|| {
-            let _ = writeln!(
-                stderr,
-                "ERROR: requires 1 argument of how long to sleep for in seconds"
-            );
+    let stdout = WinStdOut::new().unwrap_or_else(|| exit_process((-1i32) as u32));
 
-            exit_process(1)
-        });
+    let (_exec_name, rem) = get_next_arg(cmd_str).unwrap_or_else(|| exit_process((-1i32) as u32));
+    let (arg1, _rem) = get_next_arg(rem).unwrap_or_else(|| {
+        // TODO: add usage printing in this case
+        exit_process((-1i32) as u32)
+    });
 
-        let f_durr = duration
-            .parse::<f32>()
-            .ok()
-            .and_then(|x| (x >= 0.0).then_some(x))
-            .unwrap_or_else(|| {
-                let _ = writeln!(
-                    stderr,
-                    "ERROR: invalid number of seconds to sleep for: {duration}"
-                );
+    let num_ms = read_fixed_pt::<3>(arg1).unwrap_or_else(|_| exit_process((-1i32) as u32));
 
-                exit_process(1)
-            });
+    stdout
+        .write_utf16(utf16_str_lit!("will now sleep for: "))
+        .unwrap_or_else(|_| exit_process((-1i32) as u32));
+    stdout
+        .write_fixed_pt::<3>(num_ms)
+        .unwrap_or_else(|_| exit_process((-1i32) as u32));
+    stdout
+        .write_utf16(utf16_str_lit!("s\r\n"))
+        .unwrap_or_else(|_| exit_process((-1i32) as u32));
 
-        let _ = writeln!(stdout, "sleeping for {:.3}s", f_durr);
-        sleep(f_durr);
-    }
+    sleep_ms(num_ms);
 
     exit_process(0)
+
+    // let result = get_cmd_line();
+    // let mut stdout = WinStdOut::new().unwrap_or_else(|| exit_process(2));
+    // let mut stderr = WinErrOut::new().unwrap_or_else(|| exit_process(2));
+
+    // if let Some(cmd) = result {
+    //     let duration = cmd.split_whitespace().skip(1).next().unwrap_or_else(|| {
+    //         let _ = writeln!(
+    //             stderr,
+    //             "ERROR: requires 1 argument of how long to sleep for in seconds"
+    //         );
+
+    //         exit_process(1)
+    //     });
+
+    //     let f_durr = duration
+    //         .parse::<f32>()
+    //         .ok()
+    //         .and_then(|x| (x >= 0.0).then_some(x))
+    //         .unwrap_or_else(|| {
+    //             let _ = writeln!(
+    //                 stderr,
+    //                 "ERROR: invalid number of seconds to sleep for: {duration}"
+    //             );
+
+    //             exit_process(1)
+    //         });
+
+    //     let _ = writeln!(stdout, "sleeping for {:.3}s", f_durr);
+    //     sleep(f_durr);
+    // }
+
+    // exit_process(0)
 }

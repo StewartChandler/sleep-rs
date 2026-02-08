@@ -20,6 +20,3 @@ panic="abort"
 [profile.release]
 panic="abort"
 opt-level="z"
-
-[build-dependencies]
-embed-manifest = "1.5.0"
