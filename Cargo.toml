@@ -2,6 +2,9 @@
 name = "sleep_rs"
 version = "0.1.0"
 edition = "2024"
+authors = ["Stewart Chandler <stewartdchandler@gmail.com>"]
+description = "A minimal sleep program built for windows."
+readme = "README.md"
 
 [[bin]]
 name="sleep_rs"
@@ -9,8 +12,6 @@ test=false
 bench=false
 
 [dependencies]
-no-panic = "0.1.35"
-windows-link = "0.2.1"
 windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_System_Console", "Win32_System_Environment", "Win32_System_Threading"] }
 
 [profile.dev]

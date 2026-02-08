@@ -9,8 +9,6 @@ use core::{
     ptr::{self},
 };
 
-use no_panic::no_panic;
-
 // needs to be seen by the linker in order to make floats work
 #[allow(non_upper_case_globals)]
 #[unsafe(no_mangle)]
@@ -78,7 +76,6 @@ fn get_cmd_line() -> Option<&'static str> {
 ///   - `0i32` if `x` is not finite
 ///   - `i32::MAX` if `x` is greater than `i32::MAX`
 ///   - `i32::MIN` if `x` is less than `i32::MIN`
-#[no_panic]
 fn round(x: f32) -> i32 {
     if !x.is_finite() {
         return 0;
@@ -153,7 +150,8 @@ impl<const HT: win32::STD_HANDLE> WinHandleOut<HT> {
     pub fn new() -> Option<Self> {
         let handle = unsafe { win32::GetStdHandle(HT) };
 
-        (handle != win32::INVALID_HANDLE_VALUE).then_some(Self { handle: handle })
+        (!handle.is_null() && handle != win32::INVALID_HANDLE_VALUE)
+            .then_some(Self { handle: handle })
     }
 }
 
