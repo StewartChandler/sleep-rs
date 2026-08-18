@@ -20,3 +20,5 @@ panic="abort"
 [profile.release]
 panic="abort"
 opt-level="z"
+strip=true
+lto=true
