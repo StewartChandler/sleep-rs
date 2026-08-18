@@ -63,10 +63,24 @@ use windows_sys::{
     w,
 };
 
-// needs to be seen by the linker in order to make floats work
-#[allow(non_upper_case_globals)]
+// // needs to be seen by the linker in order to make floats work
+// #[allow(non_upper_case_globals)]
+// #[unsafe(no_mangle)]
+// pub static _fltused: i32 = 0;
+
+// required by lack of ucrt link
+
+/// # Safety
+///   - `wstr` must be a pointer to a NUL terminated wchar_t string
 #[unsafe(no_mangle)]
-pub static _fltused: i32 = 0;
+pub unsafe extern "C" fn wcslen(wstr: *const u16) -> usize {
+    // Safety: `wstr` is a pointer to a NUL terminated string so it is safe to index into it up to
+    // the point where we reach a NUL character
+    (0..)
+        .map(|idx| unsafe { wstr.offset(idx) })
+        .take_while(|&ptr| unsafe { *ptr } != NUL_CHR)
+        .count()
+}
 
 /// gracefully terminates the current process
 ///
@@ -129,7 +143,7 @@ impl<const HT: STD_HANDLE> WinHandleOut<HT> {
     pub fn new() -> Option<Self> {
         let handle = unsafe { GetStdHandle(HT) };
 
-        (!handle.is_null() && handle != INVALID_HANDLE_VALUE).then_some(Self { handle: handle })
+        (!handle.is_null() && handle != INVALID_HANDLE_VALUE).then_some(Self { handle })
     }
 
     pub fn write_utf16(&self, utf16_str: &[u16]) -> Result<(), ()> {
@@ -213,26 +227,24 @@ fn read_fixed_pt<const PTS: usize>(buf: &[u16]) -> Result<u32, ()> {
             .iter()
             .enumerate()
             .find_map(|(idx, &chr)| (chr == POINT_CHR).then_some(idx))
-            .ok_or(())?;
+            .unwrap_or(buf.len());
 
-        (&buf[..split_idx], &buf[split_idx + 1..])
+        (&buf[..split_idx], &buf[buf.len().min(split_idx + 1)..])
     };
 
     int_pt
         .iter()
-        .copied()
-        .all(|x| x >= ZERO_CHR && x < ZERO_CHR + 10)
+        .all(|x| (ZERO_CHR..ZERO_CHR + 10).contains(x))
         .then_some(())
         .ok_or(())?;
     fract_pt
         .iter()
-        .copied()
-        .all(|x| x >= ZERO_CHR && x < ZERO_CHR + 10)
+        .all(|x| (ZERO_CHR..ZERO_CHR + 10).contains(x))
         .then_some(())
         .ok_or(())?;
 
     let int_pt = int_pt
-        .into_iter()
+        .iter()
         .rev()
         .enumerate()
         .map(|(idx, chr)| (chr - ZERO_CHR) as u32 * 10u32.pow(idx as u32))
@@ -240,8 +252,9 @@ fn read_fixed_pt<const PTS: usize>(buf: &[u16]) -> Result<u32, ()> {
 
     // TODO: deal with rounding
     let fract_pt = fract_pt
-        .into_iter()
+        .iter()
         .enumerate()
+        .take(PTS)
         .map(|(idx, chr)| (chr - ZERO_CHR) as u32 * 10u32.pow((PTS - 1 - idx) as u32))
         .fold(0u32, |acc, x| acc.saturating_add(x));
 
